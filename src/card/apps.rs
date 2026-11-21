@@ -18,10 +18,16 @@ use crate::disk::{self, Category};
 use crate::ui::z;
 use crate::uninstall::{self, App};
 
+/// Read once in the background and kept while the panel is closed, so
+/// opening it again is instant. The refresh button reads them again.
 #[derive(Default)]
 pub(super) struct Apps {
-    /// None while the apps are being read.
+    /// Whether the panel is open.
+    pub(super) shown: bool,
+    /// None until the apps are first read.
     list: Option<Vec<App>>,
+    /// Whether the apps are being read.
+    loading: bool,
     /// The app showing its files.
     open: Option<usize>,
     removing: bool,
@@ -62,10 +68,23 @@ const REMOVE: &str = if cfg!(target_os = "macos") {
 
 impl Card {
     pub(super) fn show_apps(&mut self, cx: &mut Context<Self>) {
-        if self.apps.is_some() || self.phase != Phase::Idle {
+        if self.apps.shown || self.phase != Phase::Idle {
             return;
         }
-        self.apps = Some(Apps::default());
+        self.apps.shown = true;
+        if self.apps.list.is_none() {
+            self.load_apps(cx);
+        }
+    }
+
+    /// Reads the apps in the background, keeping the old list on screen
+    /// until the new one is in. Removing waits for it, so the list can't
+    /// change under a removal.
+    pub(super) fn load_apps(&mut self, cx: &mut Context<Self>) {
+        if self.apps.loading || self.apps.removing {
+            return;
+        }
+        self.apps.loading = true;
         let demo = self.demo;
         cx.spawn(async move |this, cx| {
             let list = cx
@@ -73,11 +92,13 @@ impl Card {
                 .spawn(async move { uninstall::list(&disk::home(), demo) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(apps) = &mut this.apps {
-                    apps.reveal = vec![0.0; list.len()];
-                    *apps.heights.borrow_mut() = vec![0.0; list.len()];
-                    apps.list = Some(list);
-                }
+                let apps = &mut this.apps;
+                apps.loading = false;
+                apps.open = None;
+                apps.note = None;
+                apps.reveal = vec![0.0; list.len()];
+                *apps.heights.borrow_mut() = vec![0.0; list.len()];
+                apps.list = Some(list);
                 cx.notify();
             });
         })
@@ -86,23 +107,29 @@ impl Card {
 
     /// Escape: closes the panel, unless an app is being removed.
     pub(super) fn dismiss_apps(&mut self, cx: &mut Context<Self>) {
-        if self.apps.as_ref().is_some_and(|apps| !apps.removing) {
+        if !self.apps.removing {
             self.close_apps(cx);
         }
     }
 
+    /// Hides the panel and keeps the list for next time.
     fn close_apps(&mut self, cx: &mut Context<Self>) {
-        if let Some(apps) = self.apps.take()
-            && apps.changed
-        {
+        let apps = &mut self.apps;
+        apps.shown = false;
+        apps.open = None;
+        apps.note = None;
+        apps.reveal.fill(0.0);
+        apps.scroll = Default::default();
+        if std::mem::take(&mut apps.changed) {
             self.scan(cx);
         }
     }
 
     fn remove_app(&mut self, i: usize, cx: &mut Context<Self>) {
-        let Some(apps) = &mut self.apps else {
+        let apps = &mut self.apps;
+        if apps.loading {
             return;
-        };
+        }
         let Some(app) = apps.list.as_mut().and_then(|list| list.get(i)) else {
             return;
         };
@@ -120,19 +147,18 @@ impl Card {
                 .spawn(async move { app.remove() })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(apps) = &mut this.apps {
-                    apps.removing = false;
-                    apps.changed = true;
-                    if ok {
-                        apps.open = None;
-                        if let Some(list) = &mut apps.list {
-                            list.remove(i);
-                            apps.reveal.remove(i);
-                            apps.heights.borrow_mut().remove(i);
-                        }
-                    } else {
-                        apps.note = Some(format!("Couldn't remove all of {name}."));
+                let apps = &mut this.apps;
+                apps.removing = false;
+                apps.changed = true;
+                if ok {
+                    apps.open = None;
+                    if let Some(list) = &mut apps.list {
+                        list.remove(i);
+                        apps.reveal.remove(i);
+                        apps.heights.borrow_mut().remove(i);
                     }
+                } else {
+                    apps.note = Some(format!("Couldn't remove all of {name}."));
                 }
                 cx.notify();
             });
@@ -141,7 +167,10 @@ impl Card {
     }
 
     pub(super) fn render_apps(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let apps = self.apps.as_ref()?;
+        let apps = &self.apps;
+        if !apps.shown {
+            return None;
+        }
         let muted = rgb(MUTED);
 
         let body = match &apps.list {
@@ -163,12 +192,7 @@ impl Card {
                     .map(|(i, app)| self.app_row(i, app, apps, cx))
                     .collect();
                 apps.scroll
-                    .area(
-                        "apps-list",
-                        cx,
-                        |this| this.apps.as_mut().map(|a| &mut a.scroll),
-                        rows,
-                    )
+                    .area("apps-list", cx, |this| Some(&mut this.apps.scroll), rows)
                     .border_t_1()
                     .border_color(rgb(LINE))
                     .into_any_element()
@@ -187,13 +211,28 @@ impl Card {
             .bg(rgb(0x1c1c1f))
             .child(
                 h_flex()
-                    .justify_between()
+                    .gap_1()
                     .child(
                         div()
+                            .flex_1()
                             .text_size(z(20.0))
                             .font_weight(FontWeight::MEDIUM)
                             .child("Apps"),
                     )
+                    // The first read shows its own spinner below.
+                    .children(apps.list.is_some().then(|| {
+                        Button::new("apps-refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RefreshCw)
+                            .tooltip("Refresh")
+                            .loading(apps.loading)
+                            .disabled(apps.removing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_apps(cx);
+                                cx.notify();
+                            }))
+                    }))
                     .child(
                         Button::new("apps-close")
                             .ghost()
@@ -237,9 +276,8 @@ impl Card {
             .py_2()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(apps) = &mut this.apps
-                    && !apps.removing
-                {
+                let apps = &mut this.apps;
+                if !apps.removing {
                     apps.open = if apps.open == Some(i) { None } else { Some(i) };
                     apps.note = None;
                 }
@@ -326,7 +364,7 @@ impl Card {
                                 .primary()
                                 .small()
                                 .label(REMOVE)
-                                .disabled(removing)
+                                .disabled(removing || apps.loading)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.remove_app(i, cx);
                                     cx.notify();

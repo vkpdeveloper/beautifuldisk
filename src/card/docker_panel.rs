@@ -20,12 +20,19 @@ use crate::docker::{self, Chosen, Docker, State};
 use crate::icons::{self, Logo, Source};
 use crate::ui::z;
 
+/// Docker is read once in the background and kept while the panel is
+/// closed, so opening it again is instant. The refresh button reads it again.
 pub(super) struct DockerPanel {
+    /// Whether the panel is open.
+    pub(super) shown: bool,
     bin: PathBuf,
     demo: bool,
     icon: Option<Arc<Image>>,
-    /// None while Docker is being read.
+    /// None until Docker is first read.
     state: Option<State>,
+    /// Whether Docker is being read, after a clear or on its own. Clearing
+    /// and picking wait for it, so picks always match what is shown.
+    loading: bool,
     /// Picked log containers by ID, old builds by image name, and the
     /// other parts.
     logs: HashSet<String>,
@@ -45,6 +52,28 @@ pub(super) struct DockerPanel {
 }
 
 impl DockerPanel {
+    pub(super) fn new(bin: PathBuf, demo: bool) -> Self {
+        Self {
+            shown: false,
+            bin,
+            demo,
+            icon: None,
+            state: None,
+            loading: false,
+            logs: HashSet::new(),
+            builds: HashSet::new(),
+            cache: false,
+            unused: false,
+            stopped: false,
+            volumes: false,
+            busy: None,
+            note: None,
+            asking: false,
+            changed: false,
+            scroll: Scroll::default(),
+        }
+    }
+
     pub(super) fn tick(&mut self, dt: f32) -> bool {
         self.scroll.tick(dt)
     }
@@ -116,30 +145,16 @@ impl DockerPanel {
 
 impl Card {
     pub(super) fn show_docker(&mut self, cx: &mut Context<Self>) {
-        if self.docker.is_some() || self.phase != Phase::Idle {
-            return;
-        }
-        let Some(bin) = self.docker_bin.clone() else {
+        let Some(panel) = &mut self.docker else {
             return;
         };
-        self.docker = Some(DockerPanel {
-            bin,
-            demo: self.demo,
-            icon: None,
-            state: None,
-            logs: HashSet::new(),
-            builds: HashSet::new(),
-            cache: false,
-            unused: false,
-            stopped: false,
-            volumes: false,
-            busy: None,
-            note: None,
-            asking: false,
-            changed: false,
-            scroll: Scroll::default(),
-        });
-        self.reread_docker(cx);
+        if panel.shown || self.phase != Phase::Idle {
+            return;
+        }
+        panel.shown = true;
+        if panel.state.is_none() {
+            self.reread_docker(cx);
+        }
     }
 
     /// Escape: backs out of the restart question, else closes the panel.
@@ -158,15 +173,22 @@ impl Card {
         }
     }
 
+    /// Hides the panel and keeps what was read for next time.
     fn close_docker(&mut self, cx: &mut Context<Self>) {
-        if let Some(panel) = self.docker.take()
-            && panel.changed
-        {
+        let Some(panel) = &mut self.docker else {
+            return;
+        };
+        panel.shown = false;
+        panel.asking = false;
+        panel.note = None;
+        panel.scroll = Scroll::default();
+        if std::mem::take(&mut panel.changed) {
             self.scan(cx);
         }
     }
 
     /// Reads Docker again in the background, after `then` runs there.
+    /// One job at a time: the buttons that start one wait for the last.
     fn docker_job(
         &mut self,
         busy: Option<&'static str>,
@@ -176,6 +198,10 @@ impl Card {
         let Some(panel) = &mut self.docker else {
             return;
         };
+        if panel.loading {
+            return;
+        }
+        panel.loading = true;
         panel.busy = busy;
         panel.note = None;
         let bin = panel.bin.clone();
@@ -198,6 +224,7 @@ impl Card {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(panel) = &mut this.docker {
+                    panel.loading = false;
                     panel.busy = None;
                     panel.note = note;
                     panel.icon = icon;
@@ -209,7 +236,7 @@ impl Card {
         .detach();
     }
 
-    fn reread_docker(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reread_docker(&mut self, cx: &mut Context<Self>) {
         self.docker_job(None, |_| None, cx);
     }
 
@@ -260,9 +287,10 @@ impl Card {
     }
 
     pub(super) fn render_docker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let panel = self.docker.as_ref()?;
+        let panel = self.docker.as_ref().filter(|p| p.shown)?;
         let muted = rgb(MUTED);
         let busy = panel.busy.is_some();
+        let loading = panel.loading;
 
         let status = match &panel.state {
             None => "",
@@ -294,9 +322,23 @@ impl Card {
                     } else {
                         "Clear".into()
                     })
-                    .disabled(busy || total == 0)
+                    .disabled(loading || total == 0)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.clear_docker(cx);
+                        cx.notify();
+                    }))
+            }))
+            // The first read shows its own spinner below.
+            .children(panel.state.is_some().then(|| {
+                Button::new("docker-refresh")
+                    .ghost()
+                    .small()
+                    .icon(IconName::RefreshCw)
+                    .tooltip("Refresh")
+                    .loading(loading && !busy)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reread_docker(cx);
                         cx.notify();
                     }))
             }))
@@ -336,7 +378,7 @@ impl Card {
                     Button::new("docker-start")
                         .small()
                         .label("Start Docker")
-                        .disabled(busy)
+                        .disabled(loading)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.start_docker(cx);
                             cx.notify();
@@ -418,7 +460,7 @@ impl Card {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let muted = rgb(MUTED);
-        let busy = panel.busy.is_some();
+        let busy = panel.loading;
         let mut rows = Vec::new();
 
         if !docker.logs.is_empty() {

@@ -227,14 +227,15 @@ pub struct Card {
     kept: Vec<String>,
     /// First launch on macOS: which guarded folders to scan, before the scan.
     onboarding: Option<onboarding::Onboarding>,
-    /// The panel for removing apps, while it is open.
-    apps: Option<apps::Apps>,
-    /// The Docker panel, while it is open.
+    /// The panel for removing apps.
+    apps: apps::Apps,
+    /// The Docker panel, when the docker CLI is installed.
     docker: Option<docker_panel::DockerPanel>,
+    /// Whether the next scan to finish reads Docker and the apps again in
+    /// the background: the first one, and every Rescan.
+    reload_panels: bool,
     /// Holds keyboard focus so Escape reaches the card.
     focus: FocusHandle,
-    /// The docker CLI, when installed.
-    docker_bin: Option<std::path::PathBuf>,
     /// Which list fills the bottom: the caches, or the user's own files.
     view: View,
     files: your_files::FilesView,
@@ -310,13 +311,14 @@ impl Card {
             was_cleaning: 0,
             kept: Vec::new(),
             onboarding: None,
-            apps: None,
-            docker: None,
-            docker_bin: if demo {
+            apps: Default::default(),
+            docker: if demo {
                 Some("docker".into())
             } else {
                 crate::docker::find()
-            },
+            }
+            .map(|bin| docker_panel::DockerPanel::new(bin, demo)),
+            reload_panels: true,
             update: None,
             view: View::Caches,
             files: Default::default(),
@@ -486,6 +488,11 @@ impl Card {
                     self.target[Category::System as usize] = system;
                     self.progress.set_system(system as u64);
                     self.phase = Phase::Idle;
+                    // After the scan, so the reads don't compete with it.
+                    if std::mem::take(&mut self.reload_panels) {
+                        self.load_apps(cx);
+                        self.reread_docker(cx);
+                    }
                 }
                 Phase::Clearing => {
                     // What was cleared is gone; what was kept stays, unselected.
@@ -729,12 +736,11 @@ impl Card {
         let rate = 260.0 / (emit.len().max(1) as f32).sqrt();
         bar::step_particles(&mut self.particles, &mut self.rng, dt, &emit, rate);
 
-        if let Some(apps) = &mut self.apps
-            && apps.tick(dt)
-        {
+        if self.apps.shown && self.apps.tick(dt) {
             moving = true;
         }
         if let Some(docker) = &mut self.docker
+            && docker.shown
             && docker.tick(dt)
         {
             moving = true;
@@ -1676,7 +1682,7 @@ impl Render for Card {
                 h_flex()
                     .gap_1()
                     .children(self.update_button(cx))
-                    .children(self.docker_bin.is_some().then(|| {
+                    .children(self.docker.is_some().then(|| {
                         Button::new("docker")
                             .ghost()
                             .small()
@@ -1708,6 +1714,7 @@ impl Render for Card {
                             .label("Rescan")
                             .disabled(!idle)
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.reload_panels = true;
                                 this.scan(cx);
                                 cx.notify();
                             })),
@@ -1814,9 +1821,9 @@ impl Render for Card {
             .track_focus(&self.focus)
             .key_context("Card")
             .on_action(cx.listener(|this, _: &crate::Dismiss, _, cx| {
-                if this.apps.is_some() {
+                if this.apps.shown {
                     this.dismiss_apps(cx);
-                } else if this.docker.is_some() {
+                } else if this.docker.as_ref().is_some_and(|d| d.shown) {
                     this.dismiss_docker(cx);
                 } else if this.files_dismiss() {
                 } else {
